@@ -5,7 +5,9 @@ services:
       - "6379:6379"
 
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       - REDIS_URL=redis://redis:6379/0
     ports:
@@ -14,7 +16,9 @@ services:
       - redis
 
   worker:
-    build: ./worker
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
     environment:
       - REDIS_URL=redis://redis:6379/0
     depends_on:
