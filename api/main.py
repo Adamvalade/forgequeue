@@ -11,6 +11,9 @@ from common.constants import QUEUE_KEY, JOB_KEY_PREFIX
 r = get_redis()
 app = FastAPI(title="ForgeQueue")
 
+
+ALLOWED_JOB_TYPES = {"sleep", "fail_once", "always_fail"}
+
 class CreateJobRequest(BaseModel):
     type: str
     payload: Dict[str, Any] = {}
@@ -18,6 +21,9 @@ class CreateJobRequest(BaseModel):
 
 @app.post("/jobs")
 def create_job(req: CreateJobRequest):
+
+    if req.type not in ALLOWED_JOB_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown job type: {req.type}")
     job_id = str(uuid.uuid4())
     now = time.time()
 
