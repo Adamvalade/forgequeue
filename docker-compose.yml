@@ -21,5 +21,7 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       - REDIS_URL=redis://redis:6379/0
+      # Short visibility timeout so crash-recovery tests can wait ~15s instead of 5min.
+      - VISIBILITY_TIMEOUT_SECONDS=15
     depends_on:
       - redis

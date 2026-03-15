@@ -8,6 +8,7 @@ import time
 from common.redis_client import get_redis
 from common.constants import QUEUE_KEY, JOB_KEY_PREFIX
 from fastapi import FastAPI, HTTPException, Header
+from common.constants import QUEUE_KEY, JOB_KEY_PREFIX, JOBS_INDEX_KEY
 
 r = get_redis()
 app = FastAPI(title="ForgeQueue")
@@ -56,6 +57,7 @@ def create_job(req: CreateJobRequest, idempotency_key: str | None = Header(defau
     }
 
     r.hset(JOB_KEY_PREFIX + job_id, mapping=job)
+    r.sadd(JOBS_INDEX_KEY, job_id)
     r.lpush(QUEUE_KEY, job_id)
 
     return {"job_id": job_id, "status": "queued"}
@@ -71,20 +73,19 @@ def get_job(job_id: str):
 
 @app.get("/stats")
 def get_stats():
-    keys = r.keys(JOB_KEY_PREFIX + "*")
+    # source of truth: job hashes
+    ids = list(r.smembers(JOBS_INDEX_KEY))
 
-    stats = {
-        "queued": 0,
-        "running": 0,
-        "succeeded": 0,
-        "failed": 0,
-        "total_jobs": len(keys),
-    }
+    counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0}
 
-    for key in keys:
-        job = r.hgetall(key)
-        status = job.get("status")
-        if status in stats:
-            stats[status] += 1
+    for job_id in ids:
+        job = r.hgetall(JOB_KEY_PREFIX + job_id)
+        if not job:
+            continue
+        status = job.get("status", "")
+        if status in counts:
+            counts[status] += 1
 
-    return stats
+    counts["total_jobs"] = sum(counts.values())
+    counts["queue_depth"] = r.llen(QUEUE_KEY)
+    return counts

@@ -1,11 +1,23 @@
 import json
+import os
 import time
 import traceback
 
 from common.redis_client import get_redis
-from common.constants import QUEUE_KEY, JOB_KEY_PREFIX
+from common.constants import (
+    QUEUE_KEY,
+    JOB_KEY_PREFIX,
+    JOB_DONE_PREFIX,
+    DELAYED_KEY,
+    DLQ_KEY,
+    IN_FLIGHT_KEY,
+    VISIBILITY_TIMEOUT_SECONDS,
+)
 
 r = get_redis()
+
+# Override via env for testing (e.g. VISIBILITY_TIMEOUT_SECONDS=10 so recovery runs after 10s).
+VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", str(VISIBILITY_TIMEOUT_SECONDS)))
 
 def perform_job(r, job_id: str, job_type: str, payload: dict):
     if job_type == "sleep":
@@ -26,10 +38,14 @@ def perform_job(r, job_id: str, job_type: str, payload: dict):
 
     raise RuntimeError(f"Unknown job type: {job_type}")
 
+
 def update(job_id: str, **fields):
     fields["updated_at"] = time.time()
-    r.hset(JOB_KEY_PREFIX + job_id, mapping=fields)
-    
+    # redis-py wants strings/ints/floats, not None
+    clean = {k: v for k, v in fields.items() if v is not None}
+    r.hset(JOB_KEY_PREFIX + job_id, mapping=clean)
+
+
 def run_job(job_type: str, payload: dict, job_id: str):
     if job_type == "sleep":
         ms = int(payload.get("ms", 1000))
@@ -50,13 +66,44 @@ def run_job(job_type: str, payload: dict, job_id: str):
 def main():
     print("worker started", flush=True)
     while True:
+
+        now = time.time()
+
+        # Promote ready delayed jobs
+        due = r.zrangebyscore(DELAYED_KEY, 0, now)
+        if due:
+            r.zrem(DELAYED_KEY, *due)
+            for jid in due:
+                update(jid, status="queued", next_run_at="")
+                r.lpush(QUEUE_KEY, jid)
+
+        # Recovery pass: move in-flight jobs whose visibility timeout has passed
+        # back to the main queue so another worker can process them (worker crash recovery).
+        due_in_flight = r.zrangebyscore(IN_FLIGHT_KEY, 0, now)
+        for jid in due_in_flight:
+            r.zrem(IN_FLIGHT_KEY, jid)
+            if not r.exists(JOB_DONE_PREFIX + jid):
+                update(jid, status="queued", next_run_at="")
+                r.lpush(QUEUE_KEY, jid)
+
         item = r.brpop(QUEUE_KEY, timeout=5)
         if item is None:
             continue
         _, job_id = item
 
+        # Claim job with visibility timeout: use current time so the full timeout applies
+        # (now from loop start is stale after recovery pass and BRPOP).
+        visible_at = time.time() + VISIBILITY_TIMEOUT
+        r.zadd(IN_FLIGHT_KEY, {job_id: visible_at})
+
         job = r.hgetall(JOB_KEY_PREFIX + job_id)
         if not job:
+            r.zrem(IN_FLIGHT_KEY, job_id)
+            continue
+
+        # Idempotency check: already completed
+        if r.exists(JOB_DONE_PREFIX + job_id):
+            r.zrem(IN_FLIGHT_KEY, job_id)
             continue
 
         attempts = int(job.get("attempts", "0")) + 1
@@ -68,19 +115,30 @@ def main():
 
         try:
             run_job(job_type, payload, job_id)
+            r.zrem(IN_FLIGHT_KEY, job_id)
+            r.set(JOB_DONE_PREFIX + job_id, "1")
             update(job_id, status="succeeded", last_error="")
         except Exception as e:
             err = f"{e}\n{traceback.format_exc()}"
 
             if attempts < max_attempts:
-                # retry later
                 backoff = min(2 ** attempts, 10)
-                update(job_id, status="queued", last_error=err)
-                time.sleep(backoff)
-                r.lpush(QUEUE_KEY, job_id)
+                next_run_at = time.time() + backoff
+
+                update(
+                    job_id,
+                    status="retrying",
+                    last_error=err,
+                    next_run_at=next_run_at,
+                )
+
+                r.zrem(IN_FLIGHT_KEY, job_id)
+                r.zadd(DELAYED_KEY, {job_id: next_run_at})
             else:
-                # permanent failure
+                r.zrem(IN_FLIGHT_KEY, job_id)
                 update(job_id, status="failed", last_error=err)
+                r.lpush(DLQ_KEY, job_id)
+
 
 if __name__ == "__main__":
     main()
