@@ -10,3 +10,8 @@ A fault-tolerant job queue with retries, crash recovery, and observability.
 ## Local run
 ```bash
 docker compose up --build
+
+## run tests
+docker compose run --rm --build tests
+
+docker compose build tests --quiet && docker compose run --rm tests

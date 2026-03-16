@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Response
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 import hashlib
@@ -7,7 +7,6 @@ import json
 import time
 
 from common.redis_client import get_redis
-from fastapi import FastAPI, HTTPException, Header
 from common.constants import (
     QUEUE_KEY,
     JOB_KEY_PREFIX,
@@ -23,10 +22,21 @@ from common.constants import (
     LEASE_KEY_PREFIX,
     DEDUP_PREFIX,
     DEDUP_TTL_SECONDS,
+    HEALTH_PING_KEY,
+    WORKER_HEARTBEAT_PREFIX,
+    METRIC_JOBS_ENQUEUED_TOTAL,
 )
+from common.metrics import RedisMetricsCollector
+from common.observability import configure_logging, log_event
+from prometheus_client import CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
 
 r = get_redis()
 app = FastAPI(title="ForgeQueue")
+logger = configure_logging("forgequeue-api")
+
+# Prometheus registry backed by Redis (single /metrics view across processes).
+_registry = CollectorRegistry(auto_describe=True)
+_registry.register(RedisMetricsCollector(r))
 
 
 ALLOWED_JOB_TYPES = {"sleep", "fail_once", "always_fail"}
@@ -105,6 +115,17 @@ def create_job(req: CreateJobRequest, idempotency_key: str | None = Header(defau
     r.set(dedup_key, job_id, nx=True, ex=DEDUP_TTL_SECONDS)
     r.lpush(QUEUE_KEY, job_id)
 
+    # Metrics: Redis-backed counter (monotonic).
+    r.incr(f"{METRIC_JOBS_ENQUEUED_TOTAL}:{req.type}", 1)
+
+    log_event(
+        logger,
+        event="enqueued",
+        job_id=job_id,
+        type=req.type,
+        max_attempts=req.max_attempts,
+    )
+
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -134,6 +155,62 @@ def get_stats():
     counts["total_jobs"] = sum(counts.values())
     counts["queue_depth"] = r.llen(QUEUE_KEY)
     return counts
+
+
+@app.get("/health")
+def health():
+    """
+    Liveness: returns 200 if Redis is reachable; 503 otherwise.
+    """
+    try:
+        r.ping()
+        return {"status": "ok", "redis": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis down: {e}")
+
+
+@app.get("/ready")
+def ready():
+    """
+    Readiness: verifies Redis and (best-effort) ability to write/read a test key.
+    Also reports whether at least one worker has heartbeated recently.
+    """
+    try:
+        r.ping()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis down: {e}")
+
+    # Optional read/write ping.
+    try:
+        token = str(time.time())
+        r.set(HEALTH_PING_KEY, token, ex=30)
+        got = r.get(HEALTH_PING_KEY)
+        if got != token:
+            raise RuntimeError("health ping mismatch")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis rw failed: {e}")
+
+    # Worker liveness (at least one heartbeat key exists).
+    worker_count = 0
+    try:
+        for _ in r.scan_iter(match=WORKER_HEARTBEAT_PREFIX + "*"):
+            worker_count += 1
+            if worker_count >= 1:
+                break
+    except Exception:
+        worker_count = 0
+
+    if worker_count < 1:
+        raise HTTPException(status_code=503, detail="no workers heartbeating")
+
+    return {"status": "ok", "redis": "ok", "workers": worker_count}
+
+
+@app.get("/metrics")
+def metrics():
+    # Registry collector reads from Redis at scrape time.
+    payload = generate_latest(_registry)
+    return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
 
 def _dlq_retention_cleanup(now: float):

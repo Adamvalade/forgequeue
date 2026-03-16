@@ -19,7 +19,15 @@ from common.constants import (
     LEASE_KEY_PREFIX,
     PROCESSING_LOCK_PREFIX,
     VISIBILITY_TIMEOUT_SECONDS,
+    WORKER_HEARTBEAT_PREFIX,
+    METRIC_DLQ_ADDED_TOTAL,
+    METRIC_JOBS_COMPLETED_TOTAL,
+    METRIC_JOBS_FAILED_TOTAL,
+    METRIC_JOBS_RETRIED_TOTAL,
+    METRIC_JOB_DURATION_SECONDS,
 )
+from common.metrics import DEFAULT_DURATION_BUCKETS
+from common.observability import configure_logging, log_event
 
 r = get_redis()
 
@@ -35,6 +43,10 @@ HEARTBEAT_INTERVAL_SECONDS = float(
 )
 
 WORKER_ID = os.getenv("WORKER_ID", str(uuid.uuid4()))
+logger = configure_logging("forgequeue-worker")
+
+WORKER_HEARTBEAT_TTL_SECONDS = int(os.getenv("WORKER_HEARTBEAT_TTL_SECONDS", "60"))
+WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "15"))
 
 
 def perform_job(r, job_id: str, job_type: str, payload: dict):
@@ -134,8 +146,54 @@ def _start_heartbeat(job_id: str, token: str):
     return stop
 
 
+def _start_worker_registration():
+    """
+    Worker registration with TTL: periodically SET a key with EX.
+    API readiness can consider "at least one worker is heartbeating".
+    """
+    stop = threading.Event()
+
+    def _beat():
+        key = WORKER_HEARTBEAT_PREFIX + WORKER_ID
+        while not stop.is_set():
+            try:
+                r.set(key, str(time.time()), ex=WORKER_HEARTBEAT_TTL_SECONDS)
+            except Exception:
+                # Best-effort; if Redis is down, readiness should fail anyway.
+                pass
+            stop.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS)
+
+    t = threading.Thread(target=_beat, name=f"worker_heartbeat:{WORKER_ID}", daemon=True)
+    t.start()
+    return stop
+
+
+def _observe_duration(job_type: str, duration_seconds: float):
+    """
+    Redis-backed histogram with cumulative Prometheus-style buckets.
+    """
+    buckets = DEFAULT_DURATION_BUCKETS
+    le_values = [str(b) for b in buckets] + ["+Inf"]
+
+    pipe = r.pipeline(transaction=False)
+    pipe.incr(f"{METRIC_JOB_DURATION_SECONDS}:count:{job_type}", 1)
+    pipe.incrbyfloat(f"{METRIC_JOB_DURATION_SECONDS}:sum:{job_type}", float(duration_seconds))
+
+    # Cumulative buckets: increment all le >= value (including +Inf)
+    for le_str in le_values:
+        if le_str == "+Inf":
+            pipe.incr(f"{METRIC_JOB_DURATION_SECONDS}:bucket:{job_type}:+Inf", 1)
+            continue
+        le = float(le_str)
+        if duration_seconds <= le:
+            pipe.incr(f"{METRIC_JOB_DURATION_SECONDS}:bucket:{job_type}:{le_str}", 1)
+
+    pipe.execute()
+
+
 def main():
-    print("worker started", flush=True)
+    log_event(logger, event="worker_started", worker_id=WORKER_ID, visibility_timeout=VISIBILITY_TIMEOUT)
+    worker_hb_stop = _start_worker_registration()
     while True:
 
         now = time.time()
@@ -205,19 +263,51 @@ def main():
         payload = json.loads(job.get("payload", "{}") or "{}")
 
         update(job_id, status="running", attempts=attempts, last_error="")
+        log_event(
+            logger,
+            event="started",
+            job_id=job_id,
+            worker_id=WORKER_ID,
+            type=job_type,
+            attempts=attempts,
+            max_attempts=max_attempts,
+        )
 
         try:
+            start = time.time()
             hb_stop = _start_heartbeat(job_id, lease_token)
             try:
                 run_job(job_type, payload, job_id)
             finally:
                 hb_stop.set()
+            duration = time.time() - start
+            try:
+                _observe_duration(job_type, duration)
+            except Exception:
+                pass
             r.zrem(IN_FLIGHT_KEY, job_id)
             r.delete(lease_key)
             r.delete(proc_key)
             r.set(JOB_DONE_PREFIX + job_id, "1")
             update(job_id, status="succeeded", last_error="")
+            r.incr(f"{METRIC_JOBS_COMPLETED_TOTAL}:{job_type}", 1)
+            log_event(
+                logger,
+                event="completed",
+                job_id=job_id,
+                worker_id=WORKER_ID,
+                type=job_type,
+                duration=duration,
+                attempts=attempts,
+            )
         except Exception as e:
+            duration = None
+            try:
+                # If we failed before setting start (shouldn't happen), skip.
+                duration = time.time() - start  # type: ignore[name-defined]
+                _observe_duration(job_type, duration)
+            except Exception:
+                pass
             err = f"{e}\n{traceback.format_exc()}"
 
             if attempts < max_attempts:
@@ -235,6 +325,19 @@ def main():
                 r.delete(lease_key)
                 r.delete(proc_key)
                 r.zadd(DELAYED_KEY, {job_id: next_run_at})
+                r.incr(f"{METRIC_JOBS_RETRIED_TOTAL}:{job_type}", 1)
+                log_event(
+                    logger,
+                    event="retried",
+                    job_id=job_id,
+                    worker_id=WORKER_ID,
+                    type=job_type,
+                    duration=duration,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    next_run_at=next_run_at,
+                    error=str(e),
+                )
             else:
                 r.zrem(IN_FLIGHT_KEY, job_id)
                 r.delete(lease_key)
@@ -243,12 +346,25 @@ def main():
                 r.lpush(DLQ_KEY, job_id)
                 now2 = time.time()
                 r.zadd(DLQ_ZSET_KEY, {job_id: now2})
+                r.incr(f"{METRIC_JOBS_FAILED_TOTAL}:{job_type}", 1)
+                r.incr(f"{METRIC_DLQ_ADDED_TOTAL}:{job_type}", 1)
                 # Retention: TTL-by-time and max size.
                 r.zremrangebyscore(DLQ_ZSET_KEY, 0, now2 - DLQ_RETENTION_SECONDS)
                 # Keep only newest DLQ_MAX_SIZE items (remove oldest ranks).
                 excess = r.zcard(DLQ_ZSET_KEY) - DLQ_MAX_SIZE
                 if excess > 0:
                     r.zremrangebyrank(DLQ_ZSET_KEY, 0, excess - 1)
+                log_event(
+                    logger,
+                    event="dlq",
+                    job_id=job_id,
+                    worker_id=WORKER_ID,
+                    type=job_type,
+                    duration=duration,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    error=str(e),
+                )
 
 
 if __name__ == "__main__":

@@ -288,3 +288,121 @@ def test_heartbeat_extends_in_flight_visibility(api, r):
     assert s2 is not None
 
     assert s2 > s1, f"expected in-flight visible_at to increase, got s1={s1} s2={s2}"
+
+
+def test_health_and_ready_endpoints(api, r):
+    # /health should be 200 as long as Redis is reachable.
+    resp = requests.get(f"{api}/health", timeout=5)
+    resp.raise_for_status()
+    data = resp.json()
+    assert data.get("status") == "ok"
+    assert data.get("redis") == "ok"
+
+    # /ready requires Redis + worker heartbeat; poll briefly to avoid flakiness.
+    deadline = time.time() + 15
+    last_status = None
+    while time.time() < deadline:
+        resp2 = requests.get(f"{api}/ready", timeout=5)
+        last_status = resp2.status_code
+        if resp2.status_code == 200:
+            body = resp2.json()
+            assert body.get("status") == "ok"
+            assert body.get("redis") == "ok"
+            assert isinstance(body.get("workers"), int)
+            assert body["workers"] >= 1
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail(f"/ready did not become ready (last_status={last_status})")
+
+
+def test_worker_heartbeat_key_exists(api, r):
+    # Worker should register itself with a heartbeat key carrying a TTL.
+    # Note: the `r` fixture flushes Redis per test, so we must wait for the worker
+    # to re-register its heartbeat key.
+    deadline = time.time() + 35
+    key = None
+    ttl = None
+    while time.time() < deadline:
+        keys = r.keys("forgequeue:worker:hb:*")
+        if keys:
+            key = keys[0]
+            ttl = r.ttl(key)
+            if ttl and ttl > 0:
+                break
+        time.sleep(0.5)
+    assert key is not None, "expected at least one worker heartbeat key"
+    assert ttl is not None and ttl > 0, f"expected heartbeat TTL > 0, got ttl={ttl}"
+
+
+def test_metrics_expose_counters_and_gauges(api, r):
+    # Create jobs to exercise success, retry, and DLQ paths.
+    j_sleep = create_job(api, "sleep", {"ms": 10}, max_attempts=1)
+    j_fail_once = create_job(api, "fail_once", {}, max_attempts=2)
+    j_always_fail = create_job(api, "always_fail", {}, max_attempts=2)
+
+    wait_for_status(api, j_sleep, {"succeeded"}, timeout_s=20)
+    wait_for_status(api, j_fail_once, {"succeeded"}, timeout_s=40)
+    wait_for_status(api, j_always_fail, {"failed"}, timeout_s=40)
+
+    # Give worker a moment to flush metrics to Redis.
+    time.sleep(1)
+
+    resp = requests.get(f"{api}/metrics", timeout=5)
+    resp.raise_for_status()
+    text = resp.text
+
+    # Gauges should be present.
+    assert "queue_depth" in text
+    assert "in_flight_count" in text
+    assert "dlq_depth" in text
+
+    # Per-type counters for enqueued/completed/failed/retried/dlq_added.
+    assert 'jobs_enqueued_total{type="sleep"}' in text
+    assert 'jobs_enqueued_total{type="fail_once"}' in text
+    assert 'jobs_enqueued_total{type="always_fail"}' in text
+
+    assert 'jobs_completed_total{type="sleep"}' in text
+    assert 'jobs_completed_total{type="fail_once"}' in text
+
+    assert 'jobs_failed_total{type="always_fail"}' in text
+
+    # fail_once should have at least one retry.
+    assert 'jobs_retried_total{type="fail_once"}' in text
+
+    # always_fail should land in DLQ.
+    assert 'dlq_added_total{type="always_fail"}' in text
+
+
+def test_metrics_include_histogram_for_job_durations(api, r):
+    # Run a few sleep jobs to populate the duration histogram for type="sleep".
+    job_ids = [
+        create_job(api, "sleep", {"ms": 10}, max_attempts=1),
+        create_job(api, "sleep", {"ms": 100}, max_attempts=1),
+        create_job(api, "sleep", {"ms": 1000}, max_attempts=1),
+    ]
+    for jid in job_ids:
+        wait_for_status(api, jid, {"succeeded"}, timeout_s=30)
+
+    # Histogram keys are written by the worker; poll /metrics until it shows up to avoid flakiness.
+    deadline = time.time() + 35
+    text = ""
+    while time.time() < deadline:
+        resp = requests.get(f"{api}/metrics", timeout=5)
+        resp.raise_for_status()
+        text = resp.text
+        lines = text.splitlines()
+        has_count = any('job_processing_duration_seconds_count' in ln and 'type="sleep"' in ln for ln in lines)
+        has_sum = any('job_processing_duration_seconds_sum' in ln and 'type="sleep"' in ln for ln in lines)
+        has_bucket = any(
+            'job_processing_duration_seconds_bucket' in ln
+            and 'type="sleep"' in ln
+            and ('le="0.1"' in ln or 'le="0.5"' in ln or 'le="+Inf"' in ln)
+            for ln in lines
+        )
+
+        if has_count and has_sum and has_bucket:
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail("expected sleep duration histogram to appear in /metrics")
