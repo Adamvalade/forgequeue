@@ -25,3 +25,17 @@ services:
       - VISIBILITY_TIMEOUT_SECONDS=15
     depends_on:
       - redis
+
+  tests:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    environment:
+      - API_URL=http://api:8000
+      - REDIS_URL=redis://redis:6379/0
+      # Keep aligned with worker for timing-based tests.
+      - VISIBILITY_TIMEOUT_SECONDS=15
+    depends_on:
+      - redis
+      - api
+      - worker
