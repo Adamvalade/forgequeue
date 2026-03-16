@@ -1,7 +1,9 @@
 import json
 import os
+import threading
 import time
 import traceback
+import uuid
 
 from common.redis_client import get_redis
 from common.constants import (
@@ -10,7 +12,12 @@ from common.constants import (
     JOB_DONE_PREFIX,
     DELAYED_KEY,
     DLQ_KEY,
+    DLQ_ZSET_KEY,
+    DLQ_MAX_SIZE,
+    DLQ_RETENTION_SECONDS,
     IN_FLIGHT_KEY,
+    LEASE_KEY_PREFIX,
+    PROCESSING_LOCK_PREFIX,
     VISIBILITY_TIMEOUT_SECONDS,
 )
 
@@ -18,6 +25,17 @@ r = get_redis()
 
 # Override via env for testing (e.g. VISIBILITY_TIMEOUT_SECONDS=10 so recovery runs after 10s).
 VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", str(VISIBILITY_TIMEOUT_SECONDS)))
+
+HEARTBEAT_INTERVAL_SECONDS = float(
+    os.getenv(
+        "HEARTBEAT_INTERVAL_SECONDS",
+        # Default: roughly 1/3 of visibility timeout, capped to 30s, with a 1s floor.
+        str(max(1.0, min(30.0, VISIBILITY_TIMEOUT / 3))),
+    )
+)
+
+WORKER_ID = os.getenv("WORKER_ID", str(uuid.uuid4()))
+
 
 def perform_job(r, job_id: str, job_type: str, payload: dict):
     if job_type == "sleep":
@@ -63,6 +81,59 @@ def run_job(job_type: str, payload: dict, job_id: str):
 
     raise RuntimeError(f"Unknown job type: {job_type}")
 
+
+_HEARTBEAT_LUA = """
+local lease_key = KEYS[1]
+local in_flight_key = KEYS[2]
+local job_id = ARGV[1]
+local token = ARGV[2]
+local visible_at = ARGV[3]
+local ttl_seconds = ARGV[4]
+
+if redis.call('GET', lease_key) ~= token then
+  return 0
+end
+
+redis.call('ZADD', in_flight_key, visible_at, job_id)
+redis.call('EXPIRE', lease_key, ttl_seconds)
+return 1
+"""
+
+
+def _start_heartbeat(job_id: str, token: str):
+    """
+    Heartbeat thread: extend the in-flight visible_at while the job is running.
+    Only extends if our lease token still matches.
+    """
+    stop = threading.Event()
+
+    def _beat():
+        lease_key = LEASE_KEY_PREFIX + job_id
+        while not stop.is_set():
+            time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            if stop.is_set():
+                break
+            visible_at = time.time() + VISIBILITY_TIMEOUT
+            try:
+                r.eval(
+                    _HEARTBEAT_LUA,
+                    2,
+                    lease_key,
+                    IN_FLIGHT_KEY,
+                    job_id,
+                    token,
+                    str(visible_at),
+                    str(VISIBILITY_TIMEOUT),
+                )
+            except Exception:
+                # Heartbeat is best-effort; if Redis is down, the lease will expire and job may be retried.
+                pass
+
+    t = threading.Thread(target=_beat, name=f"heartbeat:{job_id}", daemon=True)
+    t.start()
+    return stop
+
+
 def main():
     print("worker started", flush=True)
     while True:
@@ -82,6 +153,7 @@ def main():
         due_in_flight = r.zrangebyscore(IN_FLIGHT_KEY, 0, now)
         for jid in due_in_flight:
             r.zrem(IN_FLIGHT_KEY, jid)
+            r.delete(LEASE_KEY_PREFIX + jid)
             if not r.exists(JOB_DONE_PREFIX + jid):
                 update(jid, status="queued", next_run_at="")
                 r.lpush(QUEUE_KEY, jid)
@@ -91,19 +163,40 @@ def main():
             continue
         _, job_id = item
 
+        lease_key = LEASE_KEY_PREFIX + job_id
+        lease_token = f"{WORKER_ID}:{uuid.uuid4()}"
+
         # Claim job with visibility timeout: use current time so the full timeout applies
         # (now from loop start is stale after recovery pass and BRPOP).
         visible_at = time.time() + VISIBILITY_TIMEOUT
+        # Establish lease so only the owning worker can extend visibility.
+        # If we can't set it, requeue to avoid losing the job.
+        if not r.set(lease_key, lease_token, ex=VISIBILITY_TIMEOUT, nx=True):
+            r.lpush(QUEUE_KEY, job_id)
+            continue
+
         r.zadd(IN_FLIGHT_KEY, {job_id: visible_at})
 
         job = r.hgetall(JOB_KEY_PREFIX + job_id)
         if not job:
             r.zrem(IN_FLIGHT_KEY, job_id)
+            r.delete(lease_key)
             continue
 
         # Idempotency check: already completed
         if r.exists(JOB_DONE_PREFIX + job_id):
             r.zrem(IN_FLIGHT_KEY, job_id)
+            r.delete(lease_key)
+            continue
+
+        # Processing lock: prevents concurrent processing of the same job_id.
+        proc_key = PROCESSING_LOCK_PREFIX + job_id
+        proc_token = WORKER_ID
+        if not r.set(proc_key, proc_token, nx=True, ex=VISIBILITY_TIMEOUT):
+            # Someone else is processing it; release our claim and retry later.
+            r.zrem(IN_FLIGHT_KEY, job_id)
+            r.delete(lease_key)
+            r.zadd(DELAYED_KEY, {job_id: time.time() + 1.0})
             continue
 
         attempts = int(job.get("attempts", "0")) + 1
@@ -114,8 +207,14 @@ def main():
         update(job_id, status="running", attempts=attempts, last_error="")
 
         try:
-            run_job(job_type, payload, job_id)
+            hb_stop = _start_heartbeat(job_id, lease_token)
+            try:
+                run_job(job_type, payload, job_id)
+            finally:
+                hb_stop.set()
             r.zrem(IN_FLIGHT_KEY, job_id)
+            r.delete(lease_key)
+            r.delete(proc_key)
             r.set(JOB_DONE_PREFIX + job_id, "1")
             update(job_id, status="succeeded", last_error="")
         except Exception as e:
@@ -133,11 +232,23 @@ def main():
                 )
 
                 r.zrem(IN_FLIGHT_KEY, job_id)
+                r.delete(lease_key)
+                r.delete(proc_key)
                 r.zadd(DELAYED_KEY, {job_id: next_run_at})
             else:
                 r.zrem(IN_FLIGHT_KEY, job_id)
+                r.delete(lease_key)
+                r.delete(proc_key)
                 update(job_id, status="failed", last_error=err)
                 r.lpush(DLQ_KEY, job_id)
+                now2 = time.time()
+                r.zadd(DLQ_ZSET_KEY, {job_id: now2})
+                # Retention: TTL-by-time and max size.
+                r.zremrangebyscore(DLQ_ZSET_KEY, 0, now2 - DLQ_RETENTION_SECONDS)
+                # Keep only newest DLQ_MAX_SIZE items (remove oldest ranks).
+                excess = r.zcard(DLQ_ZSET_KEY) - DLQ_MAX_SIZE
+                if excess > 0:
+                    r.zremrangebyrank(DLQ_ZSET_KEY, 0, excess - 1)
 
 
 if __name__ == "__main__":
