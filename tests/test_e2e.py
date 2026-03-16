@@ -1,71 +1,10 @@
-import os
 import time
 import uuid
 
 import pytest
-import redis
 import requests
 
-
-API_URL = os.getenv("API_URL", "http://localhost:8000")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-VISIBILITY_TIMEOUT_SECONDS = int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", "15"))
-
-
-@pytest.fixture()
-def r():
-    client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    client.ping()
-    client.flushdb()
-    return client
-
-
-@pytest.fixture()
-def api():
-    # Ensure API is reachable before running assertions.
-    deadline = time.time() + 15
-    last_err = None
-    while time.time() < deadline:
-        try:
-            resp = requests.get(f"{API_URL}/stats", timeout=2)
-            if resp.status_code == 200:
-                return API_URL
-            last_err = f"status={resp.status_code} body={resp.text}"
-        except Exception as e:  # noqa: BLE001 - best-effort wait
-            last_err = repr(e)
-        time.sleep(0.5)
-    raise RuntimeError(f"API not ready: {last_err}")
-
-
-def create_job(api_url: str, job_type: str, payload: dict | None = None, max_attempts: int = 2, idem: str | None = None):
-    headers = {"Content-Type": "application/json"}
-    if idem:
-        headers["Idempotency-Key"] = idem
-    resp = requests.post(
-        f"{api_url}/jobs",
-        headers=headers,
-        json={"type": job_type, "payload": payload or {}, "max_attempts": max_attempts},
-        timeout=5,
-    )
-    resp.raise_for_status()
-    return resp.json()["job_id"]
-
-
-def get_job(api_url: str, job_id: str):
-    resp = requests.get(f"{api_url}/jobs/{job_id}", timeout=5)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def wait_for_status(api_url: str, job_id: str, target: set[str], timeout_s: float = 30):
-    deadline = time.time() + timeout_s
-    last = None
-    while time.time() < deadline:
-        last = get_job(api_url, job_id)
-        if last.get("status") in target:
-            return last
-        time.sleep(0.25)
-    raise AssertionError(f"Timed out waiting for {target}. Last={last}")
+from helpers import create_job, get_job, wait_for_status
 
 
 def test_idempotency_key_returns_same_job(api, r):
@@ -298,8 +237,9 @@ def test_health_and_ready_endpoints(api, r):
     assert data.get("status") == "ok"
     assert data.get("redis") == "ok"
 
-    # /ready requires Redis + worker heartbeat; poll briefly to avoid flakiness.
-    deadline = time.time() + 15
+    # /ready requires Redis + worker heartbeat. r fixture flushes Redis so worker
+    # must re-register (heartbeat interval up to 15s); allow enough time.
+    deadline = time.time() + 35
     last_status = None
     while time.time() < deadline:
         resp2 = requests.get(f"{api}/ready", timeout=5)
