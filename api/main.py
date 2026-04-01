@@ -1,4 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Header, Response
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 import hashlib
@@ -31,8 +35,25 @@ from common.observability import configure_logging, log_event
 from prometheus_client import CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
 
 r = get_redis()
-app = FastAPI(title="ForgeQueue")
+app = FastAPI(
+    title="ForgeQueue",
+    description="Fault-tolerant Redis-backed job queue with retries, crash recovery, and Prometheus metrics.",
+    version="0.1.0",
+)
 logger = configure_logging("forgequeue-api")
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "ForgeQueue",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "health": "/health",
+        "ready": "/ready",
+        "metrics": "/metrics",
+        "demo": "/demo/",
+    }
 
 # Prometheus registry backed by Redis (single /metrics view across processes).
 _registry = CollectorRegistry(auto_describe=True)
@@ -306,3 +327,17 @@ def retry_dlq_job(job_id: str, req: RetryDlqRequest = RetryDlqRequest()):
     r.lpush(QUEUE_KEY, job_id)
 
     return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/demo", include_in_schema=False)
+def demo_redirect():
+    return RedirectResponse(url="/demo/")
+
+
+_demo_dir = Path(__file__).resolve().parent / "demo"
+if _demo_dir.is_dir():
+    app.mount(
+        "/demo",
+        StaticFiles(directory=str(_demo_dir), html=True),
+        name="demo",
+    )

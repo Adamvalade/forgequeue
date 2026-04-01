@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack
+        run: docker compose up -d redis api worker
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:8000/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: Run tests
+        run: docker compose run --rm tests pytest tests/ -v --tb=short
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs

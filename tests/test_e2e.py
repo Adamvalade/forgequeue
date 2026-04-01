@@ -7,6 +7,30 @@ import requests
 from helpers import create_job, get_job, wait_for_status
 
 
+def test_root_lists_service_links(api):
+    resp = requests.get(f"{api}/", timeout=5)
+    resp.raise_for_status()
+    body = resp.json()
+    assert body.get("service") == "ForgeQueue"
+    assert body.get("docs") == "/docs"
+    assert body.get("health") == "/health"
+    assert body.get("demo") == "/demo/"
+
+
+def test_demo_page_served(api):
+    resp = requests.get(f"{api}/demo/", timeout=5)
+    resp.raise_for_status()
+    assert "ForgeQueue" in resp.text
+    assert "Live demo" in resp.text
+
+
+def test_demo_redirects_to_trailing_slash(api):
+    resp = requests.get(f"{api}/demo", allow_redirects=False, timeout=5)
+    assert resp.status_code in (301, 307, 308)
+    loc = resp.headers.get("location", "")
+    assert loc.endswith("/demo/") or loc.rstrip("/").endswith("demo")
+
+
 def test_idempotency_key_returns_same_job(api, r):
     idem = f"pytest-{uuid.uuid4()}"
     job1 = create_job(api, "sleep", {"ms": 5}, max_attempts=1, idem=idem)

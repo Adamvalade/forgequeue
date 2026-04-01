@@ -1,0 +1,46 @@
+# Render Blueprint: Key Value (Redis) + API (web) + worker.
+# https://render.com/docs/blueprint-spec
+#
+# Deploy: Dashboard → New → Blueprint → connect this repo, or use the README “Deploy to Render” button.
+#
+# Web + worker use Starter so instances stay running (no free-tier “spin down” / cold starts on first
+# request). Key Value stays on the free plan by default to keep cost down; upgrade in the dashboard
+# if you need more Redis memory or SLA.
+
+services:
+  - type: keyvalue
+    name: forgequeue-kv
+    ipAllowList: []
+    plan: free
+    maxmemoryPolicy: noeviction
+
+  - type: web
+    name: forgequeue-api
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./api/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: forgequeue-kv
+          type: keyvalue
+          property: connectionString
+
+  - type: worker
+    name: forgequeue-worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./worker/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: forgequeue-kv
+          type: keyvalue
+          property: connectionString
+      - key: VISIBILITY_TIMEOUT_SECONDS
+        value: "300"
