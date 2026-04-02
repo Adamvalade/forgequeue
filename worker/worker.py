@@ -317,7 +317,9 @@ def main():
                 finally:
                     hb_stop.set()
             duration = time.time() - start
-            if job_type == "crash_sim":
+            # First crash_sim attempt only: release claim without ack (lease expired / reclaimed).
+            # Second attempt no-ops in run_job and must fall through to normal success.
+            if job_type == "crash_sim" and attempts == 1:
                 r.zrem(IN_FLIGHT_KEY, job_id)
                 r.delete(lease_key)
                 r.delete(proc_key)
