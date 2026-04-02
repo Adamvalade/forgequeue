@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Header, Response
@@ -29,12 +30,21 @@ from common.constants import (
     HEALTH_PING_KEY,
     WORKER_HEARTBEAT_PREFIX,
     METRIC_JOBS_ENQUEUED_TOTAL,
+    METRIC_JOBS_COMPLETED_TOTAL,
+    METRIC_JOBS_FAILED_TOTAL,
+    METRIC_JOBS_RETRIED_TOTAL,
+    METRIC_DLQ_ADDED_TOTAL,
 )
 from common.metrics import RedisMetricsCollector
 from common.observability import configure_logging, log_event
 from prometheus_client import CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
 
 r = get_redis()
+_API_BOOT_AT = time.time()
+FORGEQUEUE_GITHUB_URL = os.getenv(
+    "FORGEQUEUE_GITHUB_URL", "https://github.com/Adamvalade/forgequeue"
+)
+
 app = FastAPI(
     title="ForgeQueue",
     description="Fault-tolerant Redis-backed job queue with retries, crash recovery, and Prometheus metrics.",
@@ -53,6 +63,7 @@ def root():
         "ready": "/ready",
         "metrics": "/metrics",
         "demo": "/demo/",
+        "system": "/system",
     }
 
 # Prometheus registry backed by Redis (single /metrics view across processes).
@@ -60,7 +71,7 @@ _registry = CollectorRegistry(auto_describe=True)
 _registry.register(RedisMetricsCollector(r))
 
 
-ALLOWED_JOB_TYPES = {"sleep", "fail_once", "always_fail"}
+ALLOWED_JOB_TYPES = {"sleep", "fail_once", "always_fail", "crash_sim"}
 IDEMP_PREFIX = "idemp:"
 IDEMP_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 TERMINAL_STATUSES = {"succeeded", "failed"}
@@ -156,6 +167,62 @@ def get_job(job_id: str):
     if not data:
         raise HTTPException(status_code=404, detail="job not found")
     return data
+
+
+def _sum_redis_counter(base: str) -> int:
+    total = 0
+    try:
+        for key in r.scan_iter(match=base + ":*"):
+            total += int(float(r.get(key) or 0))
+    except Exception:
+        pass
+    return total
+
+
+def _worker_heartbeat_summary():
+    now = time.time()
+    count = 0
+    newest_age = None
+    try:
+        for key in r.scan_iter(match=WORKER_HEARTBEAT_PREFIX + "*"):
+            count += 1
+            raw = r.get(key)
+            if raw is not None:
+                try:
+                    ts = float(raw)
+                    age = now - ts
+                    if newest_age is None or age < newest_age:
+                        newest_age = age
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return {"registered_workers": count, "newest_heartbeat_age_seconds": newest_age}
+
+
+@app.get("/system")
+def system_status():
+    now = time.time()
+    try:
+        qd = r.llen(QUEUE_KEY)
+        inf = r.zcard(IN_FLIGHT_KEY)
+        dlq = r.zcard(DLQ_ZSET_KEY)
+    except Exception:
+        qd = inf = dlq = -1
+    return {
+        "api_uptime_seconds": round(now - _API_BOOT_AT, 3),
+        "workers": _worker_heartbeat_summary(),
+        "queue_depth": qd,
+        "in_flight": inf,
+        "dlq_depth": dlq,
+        "totals": {
+            "jobs_enqueued": _sum_redis_counter(METRIC_JOBS_ENQUEUED_TOTAL),
+            "jobs_completed": _sum_redis_counter(METRIC_JOBS_COMPLETED_TOTAL),
+            "jobs_failed": _sum_redis_counter(METRIC_JOBS_FAILED_TOTAL),
+            "jobs_retried": _sum_redis_counter(METRIC_JOBS_RETRIED_TOTAL),
+            "dlq_added": _sum_redis_counter(METRIC_DLQ_ADDED_TOTAL),
+        },
+    }
 
 
 @app.get("/stats")
@@ -332,6 +399,11 @@ def retry_dlq_job(job_id: str, req: RetryDlqRequest = RetryDlqRequest()):
 @app.get("/demo", include_in_schema=False)
 def demo_redirect():
     return RedirectResponse(url="/demo/")
+
+
+@app.get("/demo/config.json", include_in_schema=False)
+def demo_config():
+    return {"github_url": FORGEQUEUE_GITHUB_URL}
 
 
 _demo_dir = Path(__file__).resolve().parent / "demo"

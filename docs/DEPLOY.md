@@ -1,44 +1,33 @@
-# Deploying ForgeQueue (public demo)
+# Deployment
 
-Recruiters can try the app at **`https://<your-api-host>/demo/`** once the **API**, **worker**, and **Redis** are all running. The demo UI uses relative URLs, so it works on any host without extra configuration.
+Public demo: **`https://<api-host>/demo/`** with API, worker, and Redis all running. The UI calls same-origin APIs only.
 
-## Option A — Render (Blueprint in this repo)
+## Render (blueprint)
 
-1. Push this repository to GitHub (if it is not already).
-2. In [Render](https://dashboard.render.com/), choose **New → Blueprint**, select the repo, and apply `render.yaml`.
-3. When the **web** service is live, open **`https://<forgequeue-api>.onrender.com/demo/`** (use the hostname shown in the Render dashboard).
+1. Push the repo to GitHub.
+2. [Render](https://dashboard.render.com/) → **New** → **Blueprint** → select repo → apply `render.yaml`.
+3. Open the web service URL with path **`/demo/`**.
 
-**Cost / cold starts:** The blueprint uses **Starter** for both the **web** (API) and **worker** services so Render does **not** put the API to sleep when idle—recruiters get a normal first paint without a 30–60s wake-up. You pay roughly **two Starter instances** plus **Key Value** (the blueprint keeps Redis on the **free** KV tier to limit spend; bump KV in the dashboard if you outgrow it). Check [Render pricing](https://render.com/pricing) for current numbers in your region.
+**Plans:** Blueprint uses **Starter** for the web service and worker so instances are not spun down on idle (avoids long first request after quiet periods). Key Value may stay on the free tier; see [pricing](https://render.com/pricing).
 
-**Health checks:** Render should use **`/health`** (Redis reachable). Do not point load balancers at **`/ready`** unless you always run a worker: `/ready` requires at least one worker heartbeat.
+**Health check:** use **`/health`**. Avoid **`/ready`** for the public load balancer unless a worker is always up—it requires a recent worker heartbeat.
 
-## Option B — Railway, Fly.io, or a VPS
+**GitHub link in `/demo/`:** set **`FORGEQUEUE_GITHUB_URL`** on the API (e.g. your fork URL).
 
-For **no cold starts**, use a **paid / always-on** tier (or **minimum instances ≥ 1** where the platform allows it)—same idea as Render Starter.
+## Other hosts
 
-Components:
+Use an always-on or **min instances ≥ 1** tier if you need predictable latency.
 
-| Piece    | Role |
-|----------|------|
-| Redis    | Queue + job state (`REDIS_URL`) |
-| API      | Docker image from `api/Dockerfile`; must listen on **`PORT`** (already supported) |
-| Worker   | Docker image from `worker/Dockerfile`; same `REDIS_URL` as the API |
+| Part | Notes |
+|------|--------|
+| Redis | `REDIS_URL` |
+| API | `api/Dockerfile`, **`PORT`** |
+| Worker | `worker/Dockerfile`, same `REDIS_URL`, `VISIBILITY_TIMEOUT_SECONDS` e.g. `300` in production |
 
-Set `VISIBILITY_TIMEOUT_SECONDS` on the worker in production (e.g. `300`); keep lower values only for local crash-recovery tests.
+### `rediss://` (e.g. Upstash)
 
-### TLS Redis (`rediss://`)
+If TLS verification fails: **`REDIS_SSL_CERT_REQS_NONE=1`**
 
-For providers like **Upstash**, use the TLS URL they give you. If the client fails certificate verification, set:
+## Abuse
 
-`REDIS_SSL_CERT_REQS_NONE=1`
-
-(Use only when required by the provider; it disables certificate verification.)
-
-## After deploy
-
-- Put the public URL in your resume or portfolio: **`https://…/demo/`**
-- Optional: add **`https://…/docs`** for API explorers
-
-## Optional hardening
-
-A public queue can be abused (spam jobs). For a long-lived demo you may want to add API key checks on `POST /jobs` and DLQ retry, or front the app with a known recruiter-only path. That is not implemented in the stock project.
+A public `POST /jobs` can be spammed. For a long-lived demo consider API keys or similar; not included by default.

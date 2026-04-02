@@ -15,6 +15,7 @@
         --ok: #3dcca8;
         --warn: #e8b84a;
         --err: #e07070;
+        --dlq: #c44c4c;
         --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
         --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       }
@@ -35,7 +36,7 @@
         padding: 1.5rem 1.25rem 3rem;
       }
       header {
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.25rem;
       }
       h1 {
         font-size: 1.5rem;
@@ -43,10 +44,18 @@
         letter-spacing: -0.02em;
         margin: 0 0 0.35rem;
       }
+      .tagline {
+        color: var(--text);
+        font-size: 0.95rem;
+        font-weight: 500;
+        max-width: 44rem;
+        margin: 0 0 0.5rem;
+      }
       .sub {
         color: var(--muted);
-        font-size: 0.95rem;
+        font-size: 0.88rem;
         max-width: 42rem;
+        margin: 0;
       }
       .links {
         display: flex;
@@ -67,7 +76,7 @@
         border: 1px solid var(--border);
         border-radius: 10px;
         padding: 0.85rem 1rem;
-        margin-bottom: 1.25rem;
+        margin-bottom: 1rem;
         font-size: 0.9rem;
       }
       .banner strong {
@@ -76,26 +85,48 @@
       .banner.err strong {
         color: var(--err);
       }
+      .retry-strip {
+        display: none;
+        border-radius: 10px;
+        padding: 0.65rem 0.9rem;
+        margin-bottom: 1rem;
+        font-size: 0.88rem;
+        border: 1px solid var(--border);
+        background: #1e2a1a;
+      }
+      .retry-strip.show {
+        display: block;
+      }
+      .retry-strip.retrying {
+        border-color: #6a5a2a;
+        background: #252118;
+        color: var(--warn);
+      }
+      .retry-strip.recovered {
+        border-color: #2a5a4a;
+        background: #142520;
+        color: var(--ok);
+      }
       .grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-        gap: 0.65rem;
-        margin-bottom: 1.25rem;
+        grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+        gap: 0.55rem;
+        margin-bottom: 1rem;
       }
       .stat {
         background: var(--panel);
         border: 1px solid var(--border);
         border-radius: 10px;
-        padding: 0.75rem 0.85rem;
+        padding: 0.65rem 0.75rem;
       }
       .stat .label {
-        font-size: 0.72rem;
+        font-size: 0.68rem;
         text-transform: uppercase;
         letter-spacing: 0.06em;
         color: var(--muted);
       }
       .stat .value {
-        font-size: 1.35rem;
+        font-size: 1.15rem;
         font-weight: 600;
         font-variant-numeric: tabular-nums;
       }
@@ -106,6 +137,20 @@
         padding: 1rem 1.1rem;
         margin-bottom: 1rem;
       }
+      section.dlq-hot {
+        border-color: var(--dlq);
+        box-shadow: 0 0 0 1px rgba(196, 76, 76, 0.35);
+        animation: dlqPulse 2.5s ease-in-out infinite;
+      }
+      @keyframes dlqPulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 1px rgba(196, 76, 76, 0.25);
+        }
+        50% {
+          box-shadow: 0 0 12px rgba(196, 76, 76, 0.35);
+        }
+      }
       section h2 {
         font-size: 0.85rem;
         text-transform: uppercase;
@@ -113,6 +158,24 @@
         color: var(--muted);
         margin: 0 0 0.75rem;
         font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+      }
+      .badge {
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 700;
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        background: var(--dlq);
+        color: #fff;
+        letter-spacing: 0.02em;
+      }
+      .badge.zero {
+        background: #3a4558;
+        color: var(--muted);
       }
       .row {
         display: flex;
@@ -144,6 +207,13 @@
       }
       button.primary:hover {
         background: #255a84;
+      }
+      button.danger-outline {
+        border-color: #8b4040;
+        background: #2a1a1a;
+      }
+      button.danger-outline:hover {
+        background: #3a2222;
       }
       button small {
         display: block;
@@ -214,17 +284,37 @@
     <div class="wrap">
       <header>
         <h1>ForgeQueue</h1>
+        <p class="tagline">
+          Fault-tolerant distributed job queue: retries, visibility timeouts, crash recovery, dead-letter handling.
+        </p>
         <p class="sub">
-          Visual demo of the job queue: enqueue work, watch retries and the dead-letter queue, without using the terminal.
+          Live data from Redis-backed workers and the FastAPI control plane.
         </p>
         <div class="links">
-          <a href="/docs">OpenAPI docs</a>
-          <a href="/metrics">Prometheus metrics</a>
+          <a id="githubLink" href="https://github.com/Adamvalade/forgequeue" rel="noopener" target="_blank">View source on GitHub</a>
+          <a href="/docs">OpenAPI</a>
+          <a href="/metrics">Metrics</a>
+          <a href="/system"><code>/system</code></a>
           <a href="/">JSON root</a>
         </div>
       </header>
 
       <div id="healthBanner" class="banner">Checking API…</div>
+
+      <div id="retryStrip" class="retry-strip" role="status"></div>
+
+      <section>
+        <h2>System status</h2>
+        <div class="grid" aria-live="polite">
+          <div class="stat"><div class="label">API uptime</div><div class="value" id="sysUptime">—</div></div>
+          <div class="stat"><div class="label">Workers (HB)</div><div class="value" id="sysWorkers">—</div></div>
+          <div class="stat"><div class="label">Heartbeat age</div><div class="value" id="sysHbAge">—</div></div>
+          <div class="stat"><div class="label">In flight</div><div class="value" id="sysInflight">—</div></div>
+          <div class="stat"><div class="label">Retries (total)</div><div class="value" id="sysRetries">—</div></div>
+          <div class="stat"><div class="label">Completed (total)</div><div class="value" id="sysDone">—</div></div>
+          <div class="stat"><div class="label">DLQ added (total)</div><div class="value" id="sysDlqTot">—</div></div>
+        </div>
+      </section>
 
       <div class="grid" id="statsGrid" aria-live="polite">
         <div class="stat"><div class="label">Queued</div><div class="value" id="sQueued">—</div></div>
@@ -235,22 +325,26 @@
       </div>
 
       <section>
-        <h2>Try it (one click each)</h2>
+        <h2>Scenarios</h2>
         <div class="btn-stack">
           <button type="button" class="primary" id="btnSleep">
-            Enqueue <strong>sleep</strong> job
-            <small>Completes quickly — watch “Running” then “Succeeded”.</small>
+            Enqueue <strong>sleep</strong>
+            <small>Short run → succeeded.</small>
           </button>
           <button type="button" id="btnFailOnce">
             Enqueue <strong>fail_once</strong>
-            <small>Fails once, then succeeds — shows retries in the API.</small>
+            <small>Fails once, then succeeds — watch retry messaging below.</small>
           </button>
           <button type="button" id="btnAlwaysFail">
-            Enqueue <strong>always_fail</strong> → DLQ
-            <small>Exhausts attempts and lands in the dead-letter queue.</small>
+            Enqueue <strong>always_fail</strong>
+            <small>Exhausts attempts → dead-letter queue.</small>
+          </button>
+          <button type="button" class="danger-outline" id="btnCrashSim">
+            Simulate <strong>worker loss</strong> mid-job
+            <small>No heartbeat until lease expires; another worker finishes the job (short simulated lease).</small>
           </button>
         </div>
-        <p class="hint">Last created job id (auto-filled): <span id="lastJob" style="font-family: var(--mono)">—</span></p>
+        <p class="hint">Last job id: <span id="lastJob" style="font-family: var(--mono)">—</span></p>
       </section>
 
       <section>
@@ -262,17 +356,20 @@
         <pre class="log" id="jobOut">{}</pre>
       </section>
 
-      <section>
-        <h2>Dead-letter queue</h2>
+      <section id="dlqSection">
+        <h2>
+          Dead-letter queue
+          <span id="dlqBadge" class="badge zero" aria-live="polite">0</span>
+        </h2>
         <div class="row">
-          <button type="button" id="btnDlq">Refresh DLQ</button>
+          <button type="button" id="btnDlq">Refresh list</button>
         </div>
         <ul class="dlq" id="dlqList"></ul>
-        <p class="hint">Retry uses <code>force: true</code> so you can replay the same DLQ job while demoing.</p>
+        <p class="hint">Retry uses <code>force: true</code> for repeatable demos.</p>
       </section>
 
       <section>
-        <h2>Activity log</h2>
+        <h2>Activity</h2>
         <pre class="log" id="activity"></pre>
       </section>
     </div>
@@ -282,14 +379,24 @@
         const $ = (id) => document.getElementById(id);
         const activity = $("activity");
         const lines = [];
+        let prevStatus = null;
+        let prevType = null;
+        let recoveredTimer = null;
 
         function log(msg, obj) {
           const t = new Date().toISOString().slice(11, 19);
           let line = "[" + t + "] " + msg;
           if (obj !== undefined) line += "\n" + JSON.stringify(obj, null, 2);
           lines.push(line);
-          if (lines.length > 40) lines.shift();
+          if (lines.length > 36) lines.shift();
           activity.textContent = lines.join("\n\n");
+        }
+
+        function fmtDur(sec) {
+          if (sec == null || isNaN(sec)) return "—";
+          if (sec < 60) return sec.toFixed(0) + "s";
+          if (sec < 3600) return (sec / 60).toFixed(1) + "m";
+          return (sec / 3600).toFixed(1) + "h";
         }
 
         async function api(path, opts) {
@@ -309,19 +416,50 @@
           return body;
         }
 
+        async function loadGitHubLink() {
+          try {
+            const c = await api("/demo/config.json");
+            if (c && c.github_url) $("githubLink").href = c.github_url;
+          } catch {
+            /* keep default href */
+          }
+        }
+
         async function refreshHealth() {
           const el = $("healthBanner");
           try {
             const h = await api("/health");
             el.classList.remove("err");
-            el.innerHTML =
-              "<strong>API is up.</strong> Redis: " +
-              (h.redis || "?") +
-              " — stats refresh every 2s.";
+            el.innerHTML = "<strong>API up.</strong> Redis: " + (h.redis || "?") + ".";
           } catch (e) {
             el.classList.add("err");
-            el.innerHTML =
-              "<strong>Cannot reach the API.</strong> If you are hosting ForgeQueue, confirm the API service is running and Redis is reachable. Locally: <code>docker compose up --build</code>, then reload.";
+            el.innerHTML = "<strong>API unreachable.</strong> Check the service and Redis.";
+          }
+        }
+
+        async function refreshSystem() {
+          try {
+            const s = await api("/system");
+            $("sysUptime").textContent = fmtDur(s.api_uptime_seconds);
+            const w = s.workers || {};
+            $("sysWorkers").textContent = w.registered_workers != null ? String(w.registered_workers) : "—";
+            const age = w.newest_heartbeat_age_seconds;
+            $("sysHbAge").textContent = age != null ? age.toFixed(1) + "s" : "—";
+            $("sysInflight").textContent = s.in_flight != null ? String(s.in_flight) : "—";
+            const t = s.totals || {};
+            $("sysRetries").textContent = t.jobs_retried != null ? String(t.jobs_retried) : "—";
+            $("sysDone").textContent = t.jobs_completed != null ? String(t.jobs_completed) : "—";
+            $("sysDlqTot").textContent = t.dlq_added != null ? String(t.dlq_added) : "—";
+            return s;
+          } catch {
+            $("sysUptime").textContent = "—";
+            $("sysWorkers").textContent = "—";
+            $("sysHbAge").textContent = "—";
+            $("sysInflight").textContent = "—";
+            $("sysRetries").textContent = "—";
+            $("sysDone").textContent = "—";
+            $("sysDlqTot").textContent = "—";
+            return null;
           }
         }
 
@@ -347,6 +485,60 @@
           $("jobId").value = id;
         }
 
+        function updateRetryStrip(j) {
+          const strip = $("retryStrip");
+          strip.style.borderColor = "";
+          strip.style.color = "";
+          if (!j || !j.status) return;
+          const st = j.status;
+          const att = parseInt(j.attempts, 10) || 0;
+          const jt = j.type || "";
+
+          if (st === "retrying") {
+            strip.className = "retry-strip show retrying";
+            strip.textContent =
+              "Retry #" +
+              att +
+              " — job failed and is scheduled for another attempt (backoff + delayed queue).";
+            prevStatus = st;
+            prevType = jt;
+            return;
+          }
+
+          if (st === "running" && prevStatus === "retrying" && (jt === "fail_once" || jt === "sleep")) {
+            strip.className = "retry-strip show retrying";
+            strip.textContent = "Retry attempt running (attempt " + att + ").";
+            prevStatus = st;
+            return;
+          }
+
+          if (st === "succeeded" && prevStatus === "retrying" && jt === "fail_once") {
+            strip.className = "retry-strip show recovered";
+            strip.textContent =
+              "Recovered after retry — succeeded on attempt " + att + " (fail_once path).";
+            prevStatus = st;
+            if (recoveredTimer) clearTimeout(recoveredTimer);
+            recoveredTimer = setTimeout(function () {
+              strip.className = "retry-strip";
+              strip.textContent = "";
+            }, 8000);
+            return;
+          }
+
+          if (st === "failed" && jt === "always_fail") {
+            strip.className = "retry-strip show retrying";
+            strip.style.borderColor = "var(--dlq)";
+            strip.style.color = "var(--err)";
+            strip.textContent =
+              "Job exhausted attempts → failed / dead-letter (attempt " + att + ").";
+            prevStatus = st;
+            return;
+          }
+
+          prevStatus = st;
+          prevType = jt;
+        }
+
         async function createJob(type, payload, maxAttempts) {
           const body = await api("/jobs", {
             method: "POST",
@@ -359,7 +551,9 @@
           });
           log("POST /jobs " + type, body);
           if (body.job_id) setLastJob(body.job_id);
-          refreshStats();
+          prevStatus = "queued";
+          await refreshStats();
+          await refreshSystem();
           await refreshJob();
           return body;
         }
@@ -373,17 +567,40 @@
           try {
             const j = await api("/jobs/" + encodeURIComponent(id));
             $("jobOut").textContent = JSON.stringify(j, null, 2);
+            updateRetryStrip(j);
           } catch (e) {
             $("jobOut").textContent = JSON.stringify(e.body || String(e), null, 2);
+          }
+        }
+
+        function setDlqVisual(depth, listLen) {
+          const sec = $("dlqSection");
+          const badge = $("dlqBadge");
+          const d = depth != null && depth >= 0 ? depth : listLen || 0;
+          badge.textContent = String(d);
+          if (d > 0) {
+            badge.classList.remove("zero");
+            sec.classList.add("dlq-hot");
+          } else {
+            badge.classList.add("zero");
+            sec.classList.remove("dlq-hot");
           }
         }
 
         async function refreshDlq() {
           const ul = $("dlqList");
           ul.innerHTML = "";
+          let depth = 0;
+          try {
+            const sys = await api("/system");
+            depth = sys && sys.dlq_depth != null ? sys.dlq_depth : 0;
+          } catch {
+            depth = 0;
+          }
           try {
             const data = await api("/dlq?limit=15");
             const items = data.items || [];
+            setDlqVisual(depth, items.length);
             if (!items.length) {
               ul.innerHTML = "<li>(empty)</li>";
               return;
@@ -403,8 +620,9 @@
                     body: JSON.stringify({ force: true, max_attempts: 2 }),
                   });
                   log("DLQ retry", out);
-                  refreshStats();
-                  refreshDlq();
+                  await refreshStats();
+                  await refreshSystem();
+                  await refreshDlq();
                   if (out.job_id) setLastJob(out.job_id);
                   await refreshJob();
                 } catch (e) {
@@ -418,31 +636,45 @@
           } catch (e) {
             ul.innerHTML = "<li>Error loading DLQ</li>";
             log("DLQ error", e.body || String(e));
+            setDlqVisual(depth, 0);
           }
         }
 
         $("btnSleep").addEventListener("click", () => createJob("sleep", { ms: 400 }, 1));
         $("btnFailOnce").addEventListener("click", () => createJob("fail_once", {}, 3));
         $("btnAlwaysFail").addEventListener("click", () => createJob("always_fail", {}, 2));
+        $("btnCrashSim").addEventListener("click", () =>
+          createJob(
+            "crash_sim",
+            { simulated_visibility_sec: 12, buffer_sec: 2 },
+            2
+          )
+        );
 
         $("btnRefreshJob").addEventListener("click", refreshJob);
         $("btnDlq").addEventListener("click", refreshDlq);
 
-        let pollTimer = null;
-        function startPolling() {
-          refreshStats();
-          if (pollTimer) clearInterval(pollTimer);
-          pollTimer = setInterval(refreshStats, 2000);
+        async function tick() {
+          await refreshStats();
+          await refreshSystem();
+          await refreshDlq();
         }
 
-        refreshHealth();
-        startPolling();
-        refreshDlq();
-        log("Use the buttons above to drive the queue (works the same on a deployed URL as on localhost).");
+        (async function init() {
+          await loadGitHubLink();
+          await refreshHealth();
+          await tick();
+          setInterval(tick, 2000);
+          try {
+            await createJob("sleep", { ms: 350 }, 1);
+            log("Preloaded a short sleep job on load.");
+          } catch (e) {
+            log("Preload skipped", String(e));
+          }
+        })();
 
         $("jobId").addEventListener("change", refreshJob);
 
-        // Poll active job while running/retrying (lightweight UX)
         setInterval(() => {
           const id = $("jobId").value.trim();
           if (!id) return;
@@ -452,7 +684,7 @@
               if (st === "running" || st === "queued" || st === "retrying") refreshJob();
             })
             .catch(() => {});
-        }, 800);
+        }, 700);
       })();
     </script>
   </body>

@@ -15,13 +15,44 @@ def test_root_lists_service_links(api):
     assert body.get("docs") == "/docs"
     assert body.get("health") == "/health"
     assert body.get("demo") == "/demo/"
+    assert body.get("system") == "/system"
 
 
 def test_demo_page_served(api):
     resp = requests.get(f"{api}/demo/", timeout=5)
     resp.raise_for_status()
     assert "ForgeQueue" in resp.text
-    assert "Live demo" in resp.text
+    assert "Fault-tolerant" in resp.text
+
+
+def test_system_endpoint(api):
+    resp = requests.get(f"{api}/system", timeout=5)
+    resp.raise_for_status()
+    body = resp.json()
+    assert "api_uptime_seconds" in body
+    assert body["workers"]["registered_workers"] >= 1
+    t = body["totals"]
+    assert "jobs_enqueued" in t
+    assert "jobs_completed" in t
+    assert "jobs_retried" in t
+
+
+def test_demo_config_json(api):
+    resp = requests.get(f"{api}/demo/config.json", timeout=5)
+    resp.raise_for_status()
+    data = resp.json()
+    assert data.get("github_url", "").startswith("http")
+
+
+def test_crash_sim_reclaimed_then_succeeds(api, r):
+    job_id = create_job(
+        api,
+        "crash_sim",
+        {"simulated_visibility_sec": 8, "buffer_sec": 1},
+        max_attempts=2,
+    )
+    final = wait_for_status(api, job_id, {"succeeded"}, timeout_s=60)
+    assert int(final["attempts"]) >= 2
 
 
 def test_demo_redirects_to_trailing_slash(api):

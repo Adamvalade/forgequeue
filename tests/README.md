@@ -1,33 +1,21 @@
-# ForgeQueue tests
-
-## Running tests
-
-With Docker (recommended; requires API and worker running):
+# Tests
 
 ```bash
 docker compose up -d
 docker compose run --rm tests pytest tests/ -v
 ```
 
-## Reliability test matrix
+## Reliability matrix
 
-These tests prove the queue holds up under failure. Each scenario has explicit acceptance criteria.
+| Scenario | File | Checks |
+|----------|------|--------|
+| Worker dies after claim, before ack | `test_reliability_crash_recovery.py` | Job re-queued after visibility timeout; completes or DLQ |
+| Worker dies during heartbeat window | `test_reliability_crash_recovery.py` | Same |
+| Long job + heartbeat | `test_reliability_visibility.py` | Single execution |
+| Expired in-flight reclaimed | `test_reliability_crash_recovery.py` | Recovery re-queues |
+| Exhausted retries → DLQ | `test_reliability_dlq.py` | `attempts == max_attempts`, in DLQ |
+| DLQ retry | `test_reliability_dlq.py` | Removed from DLQ; can run again |
+| Dedup same payload | `test_reliability_dedup_and_contention.py` | One logical run |
+| Two workers race reclaim | `test_reliability_dedup_and_contention.py` | At-most-one execution |
 
-| Scenario | Test file | Acceptance criteria |
-|----------|------------|----------------------|
-| **Worker dies after claiming but before ack** | `test_reliability_crash_recovery.py` | No lost jobs; job is re-queued after visibility timeout and eventually completes or goes to DLQ. |
-| **Worker dies during heartbeat window** | `test_reliability_crash_recovery.py` | Same as above; job is reclaimed and completed. |
-| **Long-running job extends visibility** | `test_reliability_visibility.py` | No double-run; job runs exactly once (heartbeat extends visibility). |
-| **Expired in-flight job gets reclaimed** | `test_reliability_crash_recovery.py` | Recovery pass re-queues; job eventually completes or DLQ. |
-| **Retry goes to DLQ after max attempts** | `test_reliability_dlq.py` | Exhausted jobs always land in DLQ; attempts == max_attempts. |
-| **DLQ retry requeues correctly** | `test_reliability_dlq.py` | Retry removes from DLQ and job can complete (or fail again). |
-| **Duplicate enqueue same logical payload** | `test_reliability_dedup_and_contention.py` | Returns same job or skips enqueue; only one logical execution. |
-| **Two workers racing for same reclaimable job** | `test_reliability_dedup_and_contention.py` | Only one actually runs it (JOB_DONE / processing lock prevents double execution). |
-
-### Global acceptance criteria (asserted across tests)
-
-- **No lost jobs** – Every claimed job eventually completes or lands in DLQ (recovery re-queues unacked).
-- **No concurrent execution of same logical job** – Dedup, processing lock, and JOB_DONE ensure at-most-once execution per logical job.
-- **Exhausted jobs always land in DLQ** – After `max_attempts` failures, job is in DLQ list and ZSET.
-- **Reclaimed jobs eventually complete or DLQ** – Recovery re-queues; worker picks up and runs to completion or exhausts retries.
-- **Metrics reflect the real state** – queue_depth, in_flight_count, and counters (enqueued/completed/failed/dlq_added) are exposed and consistent.
+**Invariants:** no silent job loss; no concurrent execution of the same logical job; terminal failures in DLQ; metrics line up with queue/DLQ depth where applicable.

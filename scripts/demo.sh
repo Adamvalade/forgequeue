@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live demo for ForgeQueue: enqueue, retries, DLQ, stats (requires `docker compose up`).
+# Terminal walkthrough; prefer /demo/ in the browser when sharing.
 set -euo pipefail
 
 BASE="${API_URL:-http://127.0.0.1:8000}"

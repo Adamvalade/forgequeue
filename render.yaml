@@ -1,11 +1,4 @@
-# Render Blueprint: Key Value (Redis) + API (web) + worker.
 # https://render.com/docs/blueprint-spec
-#
-# Deploy: Dashboard → New → Blueprint → connect this repo, or use the README “Deploy to Render” button.
-#
-# Web + worker use Starter so instances stay running (no free-tier “spin down” / cold starts on first
-# request). Key Value stays on the free plan by default to keep cost down; upgrade in the dashboard
-# if you need more Redis memory or SLA.
 
 services:
   - type: keyvalue
@@ -28,6 +21,8 @@ services:
           name: forgequeue-kv
           type: keyvalue
           property: connectionString
+      - key: FORGEQUEUE_GITHUB_URL
+        value: https://github.com/Adamvalade/forgequeue
 
   - type: worker
     name: forgequeue-worker

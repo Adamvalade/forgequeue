@@ -76,7 +76,13 @@ def update(job_id: str, **fields):
     r.hset(JOB_KEY_PREFIX + job_id, mapping=clean)
 
 
-def run_job(job_type: str, payload: dict, job_id: str):
+def run_job(
+    job_type: str,
+    payload: dict,
+    job_id: str,
+    attempt_no: int = 1,
+    visibility_seconds: int = VISIBILITY_TIMEOUT,
+):
     if job_type == "sleep":
         ms = int(payload.get("ms", 1000))
         time.sleep(ms / 1000.0)
@@ -89,6 +95,13 @@ def run_job(job_type: str, payload: dict, job_id: str):
         if r.get(key) is None:
             r.set(key, "1")
             raise RuntimeError("fail_once: intentional first failure")
+        return
+
+    if job_type == "crash_sim":
+        if attempt_no > 1:
+            return
+        extra = float(payload.get("buffer_sec", 2))
+        time.sleep(float(visibility_seconds) + extra)
         return
 
     raise RuntimeError(f"Unknown job type: {job_type}")
@@ -212,6 +225,7 @@ def main():
         for jid in due_in_flight:
             r.zrem(IN_FLIGHT_KEY, jid)
             r.delete(LEASE_KEY_PREFIX + jid)
+            r.delete(PROCESSING_LOCK_PREFIX + jid)
             if not r.exists(JOB_DONE_PREFIX + jid):
                 update(jid, status="queued", next_run_at="")
                 r.lpush(QUEUE_KEY, jid)
@@ -221,25 +235,28 @@ def main():
             continue
         _, job_id = item
 
+        job = r.hgetall(JOB_KEY_PREFIX + job_id)
+        if not job:
+            continue
+
+        job_vis = VISIBILITY_TIMEOUT
+        if job.get("type") == "crash_sim":
+            try:
+                pl = json.loads(job.get("payload", "{}") or "{}")
+                if pl.get("simulated_visibility_sec") is not None:
+                    job_vis = max(3, min(int(pl["simulated_visibility_sec"]), 3600))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+
         lease_key = LEASE_KEY_PREFIX + job_id
         lease_token = f"{WORKER_ID}:{uuid.uuid4()}"
 
-        # Claim job with visibility timeout: use current time so the full timeout applies
-        # (now from loop start is stale after recovery pass and BRPOP).
-        visible_at = time.time() + VISIBILITY_TIMEOUT
-        # Establish lease so only the owning worker can extend visibility.
-        # If we can't set it, requeue to avoid losing the job.
-        if not r.set(lease_key, lease_token, ex=VISIBILITY_TIMEOUT, nx=True):
+        visible_at = time.time() + job_vis
+        if not r.set(lease_key, lease_token, ex=job_vis, nx=True):
             r.lpush(QUEUE_KEY, job_id)
             continue
 
         r.zadd(IN_FLIGHT_KEY, {job_id: visible_at})
-
-        job = r.hgetall(JOB_KEY_PREFIX + job_id)
-        if not job:
-            r.zrem(IN_FLIGHT_KEY, job_id)
-            r.delete(lease_key)
-            continue
 
         # Idempotency check: already completed
         if r.exists(JOB_DONE_PREFIX + job_id):
@@ -250,7 +267,7 @@ def main():
         # Processing lock: prevents concurrent processing of the same job_id.
         proc_key = PROCESSING_LOCK_PREFIX + job_id
         proc_token = WORKER_ID
-        if not r.set(proc_key, proc_token, nx=True, ex=VISIBILITY_TIMEOUT):
+        if not r.set(proc_key, proc_token, nx=True, ex=job_vis):
             # Someone else is processing it; release our claim and retry later.
             r.zrem(IN_FLIGHT_KEY, job_id)
             r.delete(lease_key)
@@ -275,12 +292,44 @@ def main():
 
         try:
             start = time.time()
-            hb_stop = _start_heartbeat(job_id, lease_token)
-            try:
-                run_job(job_type, payload, job_id)
-            finally:
-                hb_stop.set()
+            if job_type == "crash_sim":
+                run_job(
+                    job_type,
+                    payload,
+                    job_id,
+                    attempt_no=attempts,
+                    visibility_seconds=job_vis,
+                )
+            else:
+                hb_stop = _start_heartbeat(job_id, lease_token)
+                try:
+                    run_job(job_type, payload, job_id, attempt_no=attempts)
+                finally:
+                    hb_stop.set()
             duration = time.time() - start
+            if job_type == "crash_sim":
+                r.zrem(IN_FLIGHT_KEY, job_id)
+                r.delete(lease_key)
+                r.delete(proc_key)
+                if r.exists(JOB_DONE_PREFIX + job_id):
+                    log_event(
+                        logger,
+                        event="crash_sim_peer_finished",
+                        job_id=job_id,
+                        worker_id=WORKER_ID,
+                        type=job_type,
+                        duration=duration,
+                    )
+                else:
+                    log_event(
+                        logger,
+                        event="crash_sim_released",
+                        job_id=job_id,
+                        worker_id=WORKER_ID,
+                        type=job_type,
+                        duration=duration,
+                    )
+                continue
             try:
                 _observe_duration(job_type, duration)
             except Exception:
