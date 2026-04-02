@@ -26,9 +26,17 @@ def test_demo_page_served(api):
 
 
 def test_system_endpoint(api):
-    resp = requests.get(f"{api}/system", timeout=5)
-    resp.raise_for_status()
-    body = resp.json()
+    # flushdb clears worker heartbeat keys; wait for the worker to register again.
+    deadline = time.time() + 25
+    body = None
+    while time.time() < deadline:
+        resp = requests.get(f"{api}/system", timeout=5)
+        resp.raise_for_status()
+        body = resp.json()
+        if body["workers"]["registered_workers"] >= 1:
+            break
+        time.sleep(0.4)
+    assert body is not None
     assert "api_uptime_seconds" in body
     assert body["workers"]["registered_workers"] >= 1
     t = body["totals"]

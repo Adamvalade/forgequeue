@@ -101,7 +101,13 @@ def run_job(
         if attempt_no > 1:
             return
         extra = float(payload.get("buffer_sec", 2))
-        time.sleep(float(visibility_seconds) + extra)
+        deadline = time.time() + float(visibility_seconds) + extra
+        while time.time() < deadline:
+            reclaim_expired_in_flight()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
         return
 
     raise RuntimeError(f"Unknown job type: {job_type}")
@@ -204,6 +210,19 @@ def _observe_duration(job_type: str, duration_seconds: float):
     pipe.execute()
 
 
+def reclaim_expired_in_flight(now: float | None = None) -> None:
+    """Re-queue in-flight jobs past visibility (same logic as the main loop). Callable during crash_sim wait so one process can reclaim without a second worker."""
+    t = time.time() if now is None else now
+    due_in_flight = r.zrangebyscore(IN_FLIGHT_KEY, 0, t)
+    for jid in due_in_flight:
+        r.zrem(IN_FLIGHT_KEY, jid)
+        r.delete(LEASE_KEY_PREFIX + jid)
+        r.delete(PROCESSING_LOCK_PREFIX + jid)
+        if not r.exists(JOB_DONE_PREFIX + jid):
+            update(jid, status="queued", next_run_at="")
+            r.lpush(QUEUE_KEY, jid)
+
+
 def main():
     log_event(logger, event="worker_started", worker_id=WORKER_ID, visibility_timeout=VISIBILITY_TIMEOUT)
     worker_hb_stop = _start_worker_registration()
@@ -219,16 +238,7 @@ def main():
                 update(jid, status="queued", next_run_at="")
                 r.lpush(QUEUE_KEY, jid)
 
-        # Recovery pass: move in-flight jobs whose visibility timeout has passed
-        # back to the main queue so another worker can process them (worker crash recovery).
-        due_in_flight = r.zrangebyscore(IN_FLIGHT_KEY, 0, now)
-        for jid in due_in_flight:
-            r.zrem(IN_FLIGHT_KEY, jid)
-            r.delete(LEASE_KEY_PREFIX + jid)
-            r.delete(PROCESSING_LOCK_PREFIX + jid)
-            if not r.exists(JOB_DONE_PREFIX + jid):
-                update(jid, status="queued", next_run_at="")
-                r.lpush(QUEUE_KEY, jid)
+        reclaim_expired_in_flight(now)
 
         item = r.brpop(QUEUE_KEY, timeout=5)
         if item is None:
