@@ -1,4 +1,15 @@
 # ForgeQueue
+## What is this?
+
+ForgeQueue is a fault-tolerant distributed job queue designed to simulate real-world backend failure scenarios.
+
+The live demo showcases:
+- Automatic retry with exponential backoff
+- Worker crash recovery via visibility timeouts + heartbeats
+- Dead-letter queue handling after repeated failure
+- Idempotent processing to prevent duplicate execution
+
+Try it here: https://forgequeue-api.onrender.com/demo/
 
 Redis-backed job queue: FastAPI control plane, Python worker, retries with backoff, visibility timeouts and heartbeats, dead-letter queue with replay, idempotency keys and short-lived deduplication, structured logs, Prometheus `/metrics`. Reliability scenarios are covered in [`tests/README.md`](tests/README.md).
 
